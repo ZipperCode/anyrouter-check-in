@@ -7,12 +7,13 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime
 
 import httpx
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from py_mini_racer import MiniRacer
 
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.notify import notify
@@ -20,6 +21,31 @@ from utils.notify import notify
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
+
+WAF_JS_BOOTSTRAP = """
+var __cookieStore = {};
+var document = {};
+Object.defineProperty(document, "cookie", {
+  get: function() {
+    return Object.keys(__cookieStore).map(function(key) {
+      return key + "=" + __cookieStore[key];
+    }).join("; ");
+  },
+  set: function(val) {
+    var mainPart = val.split(";")[0];
+    var idx = mainPart.indexOf("=");
+    if (idx > 0) {
+      var key = mainPart.slice(0, idx).trim();
+      var value = mainPart.slice(idx + 1).trim();
+      __cookieStore[key] = value;
+    }
+  }
+});
+document.location = { reload: function() {}, href: "" };
+var location = document.location;
+var window = this;
+var self = this;
+"""
 
 
 def load_balance_hash():
@@ -65,68 +91,69 @@ def parse_cookies(cookies_data):
 	return {}
 
 
-async def get_waf_cookies_with_playwright(account_name: str, login_url: str, required_cookies: list[str]):
-	"""使用 Playwright 获取 WAF cookies（隐私模式）"""
-	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
+def _execute_waf_script(script_content: str) -> tuple[dict[str, str] | None, str | None]:
+	"""执行单个 WAF 挑战脚本并收集 cookies"""
+	ctx = MiniRacer()
+	ctx.eval(WAF_JS_BOOTSTRAP)
 
-	async with async_playwright() as p:
-		import tempfile
+	try:
+		ctx.eval(f'(function(){{{script_content}\n}})();')
+	except Exception as e:
+		return None, str(e)
 
-		with tempfile.TemporaryDirectory() as temp_dir:
-			context = await p.chromium.launch_persistent_context(
-				user_data_dir=temp_dir,
-				headless=False,
-				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-				viewport={'width': 1920, 'height': 1080},
-				args=[
-					'--disable-blink-features=AutomationControlled',
-					'--disable-dev-shm-usage',
-					'--disable-web-security',
-					'--disable-features=VizDisplayCompositor',
-					'--no-sandbox',
-				],
-			)
+	try:
+		cookie_json = ctx.eval('JSON.stringify(__cookieStore)')
+	except Exception as e:
+		return None, f'Failed to read cookie store: {e}'
 
-			page = await context.new_page()
+	cookie_map = json.loads(cookie_json) if cookie_json else {}
+	if cookie_map:
+		return cookie_map, None
+	return None, 'script executed but did not set cookie'
 
-			try:
-				print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
 
-				await page.goto(login_url, wait_until='networkidle')
+async def get_waf_cookies_via_js_challenge(account_name: str, login_url: str, required_cookies: list[str]) -> dict | None:
+	"""通过执行 JS 挑战获取 WAF cookies"""
+	print(f'[PROCESSING] {account_name}: Fetching WAF challenge page...')
 
-				try:
-					await page.wait_for_function('document.readyState === "complete"', timeout=5000)
-				except Exception:
-					await page.wait_for_timeout(3000)
+	headers = {
+		'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+		'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+		'Accept-Language': 'en-US,en;q=0.9',
+	}
 
-				cookies = await page.context.cookies()
+	try:
+		async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+			response = await client.get(login_url, headers=headers)
+	except Exception as e:
+		print(f'[FAILED] {account_name}: Error fetching WAF challenge page: {e}')
+		return None
 
-				waf_cookies = {}
-				for cookie in cookies:
-					cookie_name = cookie.get('name')
-					cookie_value = cookie.get('value')
-					if cookie_name in required_cookies and cookie_value is not None:
-						waf_cookies[cookie_name] = cookie_value
+	# 收集 HTTP 响应头中的 cookies
+	collected_cookies = dict(response.cookies)
 
-				print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
+	# 提取并执行 JS 脚本
+	scripts = re.findall(r'<script[^>]*>([\s\S]*?)</script>', response.text, flags=re.IGNORECASE)
+	for script_content in scripts:
+		if not script_content.strip():
+			continue
+		cookie_map, _ = _execute_waf_script(script_content)
+		if cookie_map:
+			collected_cookies.update(cookie_map)
 
-				missing_cookies = [c for c in required_cookies if c not in waf_cookies]
+	if not collected_cookies:
+		print(f'[FAILED] {account_name}: No cookies obtained from WAF challenge')
+		return None
 
-				if missing_cookies:
-					print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
-					await context.close()
-					return None
+	# 检查是否获取了所有必需的 cookies
+	missing_cookies = [c for c in required_cookies if c not in collected_cookies]
+	if missing_cookies:
+		print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
+		return None
 
-				print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
-
-				await context.close()
-
-				return waf_cookies
-
-			except Exception as e:
-				print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
-				await context.close()
-				return None
+	print(f'[INFO] {account_name}: Got {len(collected_cookies)} WAF cookies')
+	print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
+	return collected_cookies
 
 
 def get_user_info(client, headers, user_info_url: str):
@@ -157,7 +184,7 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 
 	if provider_config.needs_waf_cookies():
 		login_url = f'{provider_config.domain}{provider_config.login_path}'
-		waf_cookies = await get_waf_cookies_with_playwright(account_name, login_url, provider_config.waf_cookie_names)
+		waf_cookies = await get_waf_cookies_via_js_challenge(account_name, login_url, provider_config.waf_cookie_names)
 		if not waf_cookies:
 			print(f'[FAILED] {account_name}: Unable to get WAF cookies')
 			return None
@@ -265,7 +292,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 async def main():
 	"""主函数"""
-	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started (using Playwright)')
+	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started (using JS challenge solver)')
 	print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
 	app_config = AppConfig.load_from_env()
